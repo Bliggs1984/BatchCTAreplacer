@@ -15,10 +15,23 @@ def check_ffmpeg_installed():
 
 def get_video_dimensions(video_path):
     try:
-        cmd = f'ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=width,height -of csv=p=0 "{video_path}"'
-        output = subprocess.check_output(cmd, shell=True).decode('utf-8').strip().split(',')
-        return int(output[0]), int(output[1])
-    except subprocess.CalledProcessError as e:
+        cmd = [
+            'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+            '-count_packets', '-show_entries', 'stream=width,height', '-of', 'csv=p=0',
+            video_path
+        ]
+        output = subprocess.check_output(cmd, text=True).strip()
+        parts = output.split(',')
+        if len(parts) >= 2:
+            return int(parts[0]), int(parts[1])
+        # Fallback: try splitting by lines
+        lines = output.splitlines()
+        if lines:
+            parts = lines[0].split(',')
+            if len(parts) >= 2:
+                return int(parts[0]), int(parts[1])
+        return None, None
+    except Exception as e:
         logging.error(f"Error getting video dimensions for {video_path}: {e}")
         return None, None
 
@@ -35,22 +48,59 @@ def find_cta_video(cta_folder, cta_name, aspect_ratio):
 
 def get_video_info(video_path):
     try:
-        cmd = f'ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=width,height,r_frame_rate -of csv=p=0 "{video_path}"'
-        output = subprocess.check_output(cmd, shell=True).decode('utf-8').strip().split(',')
-        width, height, framerate = output
+        cmd = [
+            'ffprobe', '-v', 'error', '-select_streams', 'v:0', '-count_packets',
+            '-show_entries', 'stream=width,height,r_frame_rate', '-of', 'csv=p=0', video_path
+        ]
+        output = subprocess.check_output(cmd, text=True).strip()
+        parts = output.split(',')
+        if len(parts) >= 3:
+            width = int(parts[0])
+            height = int(parts[1])
+            fr_str = parts[2]
+        else:
+            # fallback to line-based parsing
+            lines = output.splitlines()
+            if not lines:
+                return None, None, None
+            parts = lines[0].split(',')
+            if len(parts) < 3:
+                return None, None, None
+            width = int(parts[0])
+            height = int(parts[1])
+            fr_str = parts[2]
+
+        # Normalize framerate string like '25/1' to float
+        try:
+            if '/' in fr_str:
+                num, den = fr_str.split('/')
+                framerate = float(num) / float(den) if float(den) != 0 else float(num)
+            else:
+                framerate = float(fr_str)
+        except Exception:
+            framerate = float(fr_str.split('/')[0]) if '/' in fr_str else 30.0
+
         return int(width), int(height), framerate
-    except subprocess.CalledProcessError as e:
+    except Exception as e:
         logging.error(f"Error getting video info for {video_path}: {e}")
         return None, None, None
 
 def check_nvenc_availability():
-    cmd = "ffmpeg -encoders | grep nvenc"
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    return "nvenc" in result.stdout
+    try:
+        result = subprocess.run(['ffmpeg', '-encoders'], capture_output=True, text=True, check=True)
+        return 'nvenc' in result.stdout.lower()
+    except Exception:
+        return False
 
 def replace_end_of_video_keep_audio(input_video, cta_video, output_video, overlay_duration=4, use_gpu=False):
-    duration_cmd = f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{input_video}"'
-    duration = float(subprocess.check_output(duration_cmd, shell=True).decode('utf-8').strip())
+    try:
+        duration_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                        '-of', 'default=noprint_wrappers=1:nokey=1', input_video]
+        duration_out = subprocess.check_output(duration_cmd, text=True).strip()
+        duration = float(duration_out)
+    except Exception as e:
+        logging.error(f"Error getting duration for {input_video}: {e}")
+        return
     
     main_width, main_height, framerate = get_video_info(input_video)
     if main_width is None:
@@ -68,27 +118,36 @@ def replace_end_of_video_keep_audio(input_video, cta_video, output_video, overla
         f"[main][overlaid]concat=n=2:v=1:a=0[outv]"
     )
     
-    if use_gpu:
-        gpu_options = '-hwaccel cuda -c:v h264_nvenc -preset p4 -qp 23'
-    else:
-        gpu_options = '-c:v libx264 -preset medium -crf 23'
+    # Build the ffmpeg command carefully: input-related options (like -hwaccel)
+    # must appear before the input they apply to. Encoder selection (-c:v)
+    # is an output option and stays before the output file.
+    ffmpeg_cmd = ['ffmpeg', '-y']
 
-    cmd = (
-        f'ffmpeg -i "{input_video}" -accurate_seek -i "{cta_video}" '
-        f'-filter_complex "{filter_complex}" '
-        f'-map "[outv]" -map 0:a -c:a copy '
-        f'{gpu_options} '
-        f'-r {framerate} '
-        f'"{output_video}"'
-    )
-    
-    logging.info(f"Executing FFmpeg command: {cmd}")
-    
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    
+    # input-level options
+    if use_gpu:
+        ffmpeg_cmd += ['-hwaccel', 'cuda']
+
+    # inputs
+    ffmpeg_cmd += ['-i', input_video, '-accurate_seek', '-i', cta_video]
+
+    # filter, mapping and audio copy
+    ffmpeg_cmd += ['-filter_complex', filter_complex, '-map', '[outv]', '-map', '0:a', '-c:a', 'copy']
+
+    # encoder (output) options
+    if use_gpu:
+        ffmpeg_cmd += ['-c:v', 'h264_nvenc', '-preset', 'p4', '-qp', '23']
+    else:
+        ffmpeg_cmd += ['-c:v', 'libx264', '-preset', 'medium', '-crf', '23']
+
+    ffmpeg_cmd += ['-r', str(framerate), output_video]
+
+    logging.info(f"Executing FFmpeg command: {' '.join(ffmpeg_cmd)}")
+
+    result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+
     logging.info(f"FFmpeg stdout: {result.stdout}")
     logging.warning(f"FFmpeg stderr: {result.stderr}")
-    
+
     if not os.path.exists(output_video):
         logging.error(f"Error: Failed to create output video: {output_video}")
     else:

@@ -16,6 +16,7 @@ The script intelligently handles multiple languages and CTA variations. It autom
 *   **GPU Acceleration:** Optional support for NVIDIA NVENC for faster video encoding.
 *   **User-Friendly GUI:** Intuitive interface built with `tkinter` for easy operation.
 *   **FFmpeg Pre-check:** Verifies `ffmpeg` installation at startup to prevent runtime errors.
+*   **Safer FFmpeg Usage:** FFmpeg and ffprobe invocations use list-style subprocess arguments (no `shell=True`) and correctly place input-level vs output-level options to avoid parsing errors.
 
 ## Prerequisites
 
@@ -94,6 +95,12 @@ If you encounter an error stating that `ffprobe` or `ffmpeg` is not recognized, 
 *   **Video File Naming:** CTA videos should be named in the format `{cta_name}_{aspect_ratio}.mp4` (e.g., `Download Now_16x9.mp4`).
 *   **Directory Structure:** The application dynamically discovers languages and CTA types. The expected structure for CTA videos is `CTAS/<Language>/<CTA Type>/<CTA Video>`.
 *   **Code Style:** The code follows standard Python conventions (PEP 8).
+
+Notes for contributors / maintainers:
+- FFmpeg command construction: build argument lists (e.g., `['ffmpeg','-i', input, ...]`) instead of shell strings to avoid quoting/escaping bugs and security issues.
+- Input-level options (like `-hwaccel cuda`) must appear before the `-i` they apply to; encoder options (like `-c:v h264_nvenc`) belong with the output options.
+- NVENC detection: `video_processor.check_nvenc_availability()` checks `ffmpeg -encoders` output for `nvenc` (no shell `grep`), which is more cross-platform.
+- Settings: the GUI persists last-used CTA folder, Output folder, CTA duration, and GPU checkbox state to `settings.json` located next to `main.py`.
 
 ## Contributing
 
